@@ -1,0 +1,16 @@
+{
+  "name": "neg2pos",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "网页负片转正工具:片基取样、分通道特性曲线反算、IT8 扫描仪标定,WebGL2 加速",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test dist/test/",
+    "serve": "node scripts/serve.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  }
+}

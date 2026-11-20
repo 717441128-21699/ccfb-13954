@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>gpu-smoke</title></head>
+<body>
+<pre id="out">RUNNING</pre>
+<script type="module">
+import { GpuInverter } from '../dist/src/gpu/engine.js';
+import { CharacteristicCurve, buildLut } from '../dist/src/curves.js';
+import { FILM_PRESETS } from '../dist/src/films.js';
+import { TYPICAL_SCANNER, synthesizeIt8, synthesizeNegative, generateTestPhoto } from '../dist/src/synth.js';
+import { sampleGrid, calibrateFromIt8 } from '../dist/src/calibrate.js';
+import { prepareInvert, invertScan } from '../dist/src/invert.js';
+import { linearToSrgb } from '../dist/src/color.js';
+
+const out = document.getElementById('out');
+const lines = [];
+const say = (s) => { lines.push(s); out.textContent = lines.join('\n'); };
+
+try {
+  if (!GpuInverter.supported()) throw new Error('WebGL2 不可用');
+  const gpu = new GpuInverter(document.createElement('canvas'));
+  say('WebGL2 上下文: OK');
+
+  const film = FILM_PRESETS[2];
+  const model = { ...TYPICAL_SCANNER, bitDepth: 16 };
+  const w = 480, h = 360;
+  const photo = generateTestPhoto(w, h);
+  const neg = synthesizeNegative(photo, w, h, film, model);
+  const it8img = synthesizeIt8(model);
+  const measured = sampleGrid(it8img, [[0, 0], [it8img.width - 1, 0], [it8img.width - 1, it8img.height - 1], [0, it8img.height - 1]], it8img.rows, it8img.cols);
+  const calib = calibrateFromIt8(measured, it8img.refs);
+  const luts = {
+    r: buildLut(new CharacteristicCurve(film.curves.r), film.dMaxLut),
+    g: buildLut(new CharacteristicCurve(film.curves.g), film.dMaxLut),
+    b: buildLut(new CharacteristicCurve(film.curves.b), film.dMaxLut),
+  };
+  const prep = prepareInvert({ base: neg.baseMeasured, scannerMatrix: calib.matrix, luts, dMax: film.dMaxLut });
+
+  // CPU 参考
+  const lin = invertScan(neg.data, w * h, prep);
+  const cpu = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0, j = 0; i < lin.length; i += 3, j += 4) {
+    cpu[j] = Math.round(linearToSrgb(Math.min(lin[i], 1)) * 255);
+    cpu[j + 1] = Math.round(linearToSrgb(Math.min(lin[i + 1], 1)) * 255);
+    cpu[j + 2] = Math.round(linearToSrgb(Math.min(lin[i + 2], 1)) * 255);
+    cpu[j + 3] = 255;
+  }
+
+  // GPU 16bit 路径
+  const u16 = new Uint16Array(w * h * 3);
+  for (let i = 0; i < u16.length; i++) u16[i] = Math.round(neg.data[i] * 65535);
+  gpu.setLuts(luts.r, luts.g, luts.b);
+  gpu.params = { baseCal: prep.baseCal, black: prep.black, scannerMatrix: prep.scannerMatrix, dMax: prep.dMax, exposure: 1, outputMatrix: prep.outputMatrix };
+  const g16 = gpu.process({ data: u16, width: w, height: h });
+  let maxDiff16 = 0;
+  for (let i = 0; i < cpu.length; i++) maxDiff16 = Math.max(maxDiff16, Math.abs(cpu[i] - g16.data[i]));
+  say(`GPU(16bit) vs CPU 最大字节差: ${maxDiff16}/255 ${maxDiff16 <= 2 ? 'PASS' : 'FAIL'}`);
+
+  // GPU 8bit 路径
+  const u8 = new Uint8Array(w * h * 3);
+  for (let i = 0; i < u8.length; i++) u8[i] = Math.round(neg.data[i] * 255);
+  const g8 = gpu.process({ data: u8, width: w, height: h });
+  // 与 8bit 输入的 CPU 结果比
+  const neg8 = new Float32Array(u8.length);
+  for (let i = 0; i < u8.length; i++) neg8[i] = u8[i] / 255;
+  const lin8 = invertScan(neg8, w * h, prep);
+  let maxDiff8 = 0;
+  for (let i = 0, p = 0; i < lin8.length; i += 3, p += 4) {
+    for (let c = 0; c < 3; c++) {
+      const b = Math.round(linearToSrgb(Math.min(lin8[i + c], 1)) * 255);
+      maxDiff8 = Math.max(maxDiff8, Math.abs(b - g8.data[p + c]));
+    }
+  }
+  say(`GPU(8bit) vs CPU 最大字节差: ${maxDiff8}/255 ${maxDiff8 <= 2 ? 'PASS' : 'FAIL'}`);
+
+  // 36 张 12MP 基准
+  const W = 4000, H = 3000;
+  const frame = new Uint16Array(W * H * 3);
+  for (let y = 0; y < H; y++) {
+    const sy = (y * h / H) | 0;
+    for (let x = 0; x < W; x++) {
+      const sx = (x * w / W) | 0;
+      const si = (sy * w + sx) * 3, di = (y * W + x) * 3;
+      frame[di] = u16[si]; frame[di + 1] = u16[si + 1]; frame[di + 2] = u16[si + 2];
+    }
+  }
+  gpu.process({ data: frame, width: W, height: H }); // 预热
+  const N = 36;
+  const t0 = performance.now();
+  for (let i = 0; i < N; i++) gpu.process({ data: frame, width: W, height: H });
+  const total = (performance.now() - t0) / 1000;
+  say(`基准: ${N} 张 4000×3000 共 ${total.toFixed(1)} s(每张 ${(total / N).toFixed(2)} s)${total < 120 ? ' PASS(<120s)' : ' FAIL(>120s)'}`);
+
+  say(maxDiff16 <= 2 && maxDiff8 <= 2 && total < 120 ? 'ALL PASS' : 'SOME FAIL');
+} catch (e) {
+  say('ERROR: ' + (e && e.message));
+  say('SOME FAIL');
+}
+document.title = 'DONE';
+</script>
+</body>
+</html>
